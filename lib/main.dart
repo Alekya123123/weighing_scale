@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:perplexweighing/screens/weighing_scale_screen.dart';
 import 'screens/pos_screen.dart'; // Point to your POS screen
 
 void main() {
@@ -10,7 +11,12 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'POS App',
-      home: PosScreen(), // Your main POS screen
+      debugShowCheckedModeBanner: false,
+      home:
+      // PosScreen(),
+      WeighingScaleScreen(productName: 'Onion', unitPrice:10,)
+
+
     );
   }
 }
