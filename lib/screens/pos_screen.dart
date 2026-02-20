@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
-import 'weighing_scale_screen.dart'; // Adjust path if needed
+import 'weighing_scale_screen.dart';
 
 class PosScreen extends StatefulWidget {
   @override
-  State<PosScreen> createState() => _PosScreenState(); // REQUIRED
+  State<PosScreen> createState() => _PosScreenState();
 }
 
 class _PosScreenState extends State<PosScreen> {
@@ -15,15 +15,20 @@ class _PosScreenState extends State<PosScreen> {
         padding: EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // Your existing POS fields
+
             TextField(decoration: InputDecoration(labelText: 'Product Name')),
             SizedBox(height: 16),
 
             // ADD THE SCALE BUTTON HERE
             ElevatedButton(
-              onPressed: () => Navigator.push(
+              onPressed: () =>
+                  Navigator.push(
                 context,
-                MaterialPageRoute(builder: (context) => WeighingScaleScreen()),
+                MaterialPageRoute(builder: (context) =>
+                    // WeighingScaleScreen()
+                WeighingScaleScreen(productName: 'name', unitPrice:10,)
+                // AutoWeightPriceDialog(productName: 'name ', unitPrice:10,)
+                ),
               ),
               child: Text('Get Weight from Scale'),
               style: ElevatedButton.styleFrom(
