@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Datalogic Magellan 9800i, 9806 (VID 0x05F9 = 1529) -->
+    <usb-device vendor-id="1529" />
+    <!-- FTDI USB-Serial adapters (common in scale cables) -->
+    <usb-device vendor-id="1027" />
+</resources>
