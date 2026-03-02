@@ -1,8 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Common RS232-USB chips; add your scale's VID/PID if known -->
+    <!-- Magellan 9800i (FTDI Chips) -->
+    <usb-device vendor-id="1027" product-id="45249" /> <!-- 0xb0c1 -->
+    <usb-device vendor-id="1027" product-id="45250" /> <!-- 0xb0c2 -->
+    
+    <!-- General FTDI -->
+    <usb-device vendor-id="1027" />
+    
+    <!-- Other RS232-USB chips -->
     <usb-device vendor-id="1659" product-id="8963" /> <!-- PL2303 -->
     <usb-device vendor-id="4292" product-id="60000" /> <!-- CP210x -->
-    <usb-device vendor-id="1027" /> <!-- FTDI -->
     <usb-device vendor-id="1a86" /> <!-- CH340 -->
 </resources>
