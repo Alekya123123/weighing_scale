@@ -1,5 +1,4 @@
 package com.example.magellan_scale
-
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -18,7 +17,6 @@ import io.flutter.plugin.common.EventChannel
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 
-// Device type enum for separate scale vs scanner handling
 enum class DeviceType { SCALE, SCANNER, UNKNOWN }
 
 data class ConnectionInfo(
@@ -35,18 +33,14 @@ class UsbSerialManager(
 ) {
     companion object {
         private const val TAG = "UsbSerialManager"
-
         // Datalogic Magellan VID — used as SCANNER
         private const val MAGELLAN_VID = 0x05F9
         private val MAGELLAN_PIDS = intArrayOf(0x2205, 0x2601, 0x2602)
-
         // FTDI VID 1027 (0x0403) — used as SCALE
-        // Hardcoded: manufacturer=1027, product=45250 (0xB0C2) and product=45249 (0xB0C1)
-        private const val FTDI_VID = 0x0403           // 1027 decimal
-        private const val FTDI_PID_SCALE_1 = 0xB0C2  // 45250 decimal — SCALE
-        private const val FTDI_PID_SCALE_2 = 0xB0C1  // 45249 decimal — SCALE
+        private const val FTDI_VID = 0x0403
+        private const val FTDI_PID_SCALE_1 = 0xB0C2
+        private const val FTDI_PID_SCALE_2 = 0xB0C1
         private val FTDI_SCALE_PIDS = intArrayOf(FTDI_PID_SCALE_1, FTDI_PID_SCALE_2)
-
         private const val BAUD_RATE = 9600
         private const val READ_TIMEOUT_MS = 500
         private const val MAX_LOG_LINES = 200
@@ -57,26 +51,30 @@ class UsbSerialManager(
     private var eventSink: EventChannel.EventSink? = null
     @Volatile
     private var listening = false
-
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private val deviceConnections = mutableMapOf<String, ConnectionInfo>()
     private val pendingPermissions = mutableSetOf<Int>()
     private val rawLog = mutableListOf<String>()
     private var permissionReceiver: PermissionBroadcastReceiver? = null
+    private var lastLoggedDevices = setOf<String>()
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    @Suppress("DEPRECATION")
+                    val device = intent?.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                     if (device != null && listening) {
+                        Log.i(TAG, "DEVICE ATTACHED: ${device.deviceName} VID=0x${device.vendorId.toString(16)} PID=0x${device.productId.toString(16)}")
                         mainHandler.post { tryConnect(device) }
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                    @Suppress("DEPRECATION")
+                    val device = intent?.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                     if (device != null) {
+                        Log.i(TAG, "DEVICE DETACHED: ${device.deviceName}")
                         mainHandler.post { handleDetach(device) }
                     }
                 }
@@ -85,34 +83,50 @@ class UsbSerialManager(
     }
 
     init {
+        Log.i(TAG, "UsbSerialManager initialized")
         val filter = IntentFilter().apply {
             addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
             addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
         }
-        context.registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(usbReceiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            context.registerReceiver(usbReceiver, filter)
+        }
+
         permissionReceiver = PermissionBroadcastReceiver(this).also { receiver ->
             val permFilter = IntentFilter().apply { addAction(ACTION_USB_PERMISSION) }
-            context.registerReceiver(receiver, permFilter, Context.RECEIVER_EXPORTED)
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, permFilter, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(receiver, permFilter)
+            }
         }
     }
 
     fun setEventSink(sink: EventChannel.EventSink?) {
         eventSink = sink
+        if (sink != null) {
+            Log.i(TAG, "EventSink connected")
+        }
     }
 
     fun startListening() {
+        Log.i(TAG, "Start listening for devices")
         listening = true
-        emitStatus("connecting", "Connecting...")
+        emitStatus("connecting", "Scanning for devices...")
         findAndConnect()
     }
 
     fun connectToDevice(device: UsbDevice) {
+        Log.i(TAG, "Manual device connection: ${device.deviceName}")
         listening = true
         emitStatus("connecting", "Connecting...")
         tryConnect(device)
     }
 
     fun stopListening() {
+        Log.i(TAG, "Stop listening")
         listening = false
         for ((key, info) in deviceConnections.toMap()) {
             closePort(info, key)
@@ -122,43 +136,53 @@ class UsbSerialManager(
     }
 
     fun dispose() {
+        Log.i(TAG, "Dispose")
         permissionReceiver?.let { context.unregisterReceiver(it) }
         permissionReceiver = null
-        context.unregisterReceiver(usbReceiver)
+        try {
+            context.unregisterReceiver(usbReceiver)
+        } catch (_: Exception) {}
         stopListening()
         eventSink = null
     }
 
     private fun findAndConnect() {
         val deviceList = usbManager.deviceList ?: return
+
+        val currentDevices = deviceList.values
+            .filter { isTargetDevice(it) }
+            .map { it.deviceName }
+            .toSet()
+
+        if (currentDevices != lastLoggedDevices) {
+            Log.i(TAG, "Found ${currentDevices.size} target devices")
+            lastLoggedDevices = currentDevices
+        }
+
         for (device in deviceList.values) {
             if (isTargetDevice(device) && deviceConnections[device.deviceName] == null) {
+                Log.i(TAG, "Connecting: ${device.deviceName}")
                 tryConnect(device)
             }
         }
-        if (deviceConnections.isEmpty()) {
+
+        if (deviceConnections.isEmpty() && listening) {
             emitStatus("disconnected", "No device found")
         }
     }
 
-    /** Determine if a USB device is one we handle (Magellan scanner OR FTDI scale). */
     private fun isTargetDevice(device: UsbDevice): Boolean {
         val vid = device.vendorId
-        val pid = device.productId
-        return when (vid) {
-            MAGELLAN_VID -> MAGELLAN_PIDS.contains(pid)
-            FTDI_VID -> true // Accept all FTDI devices; scale PIDs hardcoded above
-            else -> false
-        }
+        return (vid == FTDI_VID) || (vid == MAGELLAN_VID)
     }
 
-    /** Identify whether a device is a SCALE or SCANNER. */
     private fun getDeviceType(device: UsbDevice): DeviceType {
         val vid = device.vendorId
         val pid = device.productId
+
         return when {
             vid == FTDI_VID && FTDI_SCALE_PIDS.contains(pid) -> DeviceType.SCALE
-            vid == FTDI_VID -> DeviceType.SCALE  // All other FTDI = treat as scale
+            vid == FTDI_VID -> DeviceType.SCALE
             vid == MAGELLAN_VID -> DeviceType.SCANNER
             else -> DeviceType.UNKNOWN
         }
@@ -169,9 +193,8 @@ class UsbSerialManager(
         for (pid in MAGELLAN_PIDS) {
             table.addProduct(MAGELLAN_VID, pid, CdcAcmSerialDriver::class.java)
         }
-        // Hardcoded FTDI scale PIDs: manufacturer=1027 (0x0403), product=45249 (0xB0C1) and 45250 (0xB0C2)
-        table.addProduct(FTDI_VID, FTDI_PID_SCALE_1, FtdiSerialDriver::class.java)  // 45250
-        table.addProduct(FTDI_VID, FTDI_PID_SCALE_2, FtdiSerialDriver::class.java)  // 45249
+        table.addProduct(FTDI_VID, FTDI_PID_SCALE_1, FtdiSerialDriver::class.java)
+        table.addProduct(FTDI_VID, FTDI_PID_SCALE_2, FtdiSerialDriver::class.java)
         return UsbSerialProber(table)
     }
 
@@ -179,17 +202,17 @@ class UsbSerialManager(
         if (!listening) return
         val key = device.deviceName
         if (deviceConnections[key] != null) return
-        if (pendingPermissions.contains(device.deviceId)) {
-            Log.d(TAG, "Already requesting permission for device ${device.deviceId}, skipping")
-            return
-        }
+        if (pendingPermissions.contains(device.deviceId)) return
+
         if (!usbManager.hasPermission(device)) {
+            Log.i(TAG, "Requesting permission: ${device.deviceId}")
             pendingPermissions.add(device.deviceId)
             emitStatus("connecting", "Requesting permission...")
             usbManager.requestPermission(device, createPermissionIntent())
             return
         }
-        openAndRead(device)
+
+        openDevice(device)
     }
 
     private fun createPermissionIntent(): android.app.PendingIntent {
@@ -202,53 +225,65 @@ class UsbSerialManager(
             pendingPermissions.remove(device.deviceId)
         }
         if (!granted || device == null) {
+            Log.w(TAG, "Permission denied")
             emitStatus("error", "Permission denied")
             return
         }
-        if (listening) openAndRead(device)
+        if (listening) {
+            openDevice(device)
+        }
     }
 
-    private fun openAndRead(device: UsbDevice) {
+    private fun openDevice(device: UsbDevice) {
         val key = device.deviceName
         val deviceType = getDeviceType(device)
-
-        Log.i(TAG, "Opening device: VID=0x${device.vendorId.toString(16)} PID=0x${device.productId.toString(16)} type=$deviceType name=$key")
+        Log.i(TAG, "Opening ${deviceType.name}: $key")
 
         val conn = usbManager.openDevice(device) ?: run {
+            Log.e(TAG, "Failed to open device")
             emitStatus("error", "Failed to open device")
             return
         }
 
         val prober = getCustomProber()
-        val driver = prober.probeDevice(device)
-        if (driver == null) {
+        val driver = prober.probeDevice(device) ?: run {
+            Log.e(TAG, "No driver found")
             conn.close()
-            emitStatus("error", "No compatible driver for device VID=0x${device.vendorId.toString(16)} PID=0x${device.productId.toString(16)}")
+            emitStatus("error", "No compatible driver")
             return
         }
 
         val ports = driver.ports
         if (ports.isEmpty()) {
+            Log.e(TAG, "No ports available")
             conn.close()
-            emitStatus("error", "No ports for device")
+            emitStatus("error", "No ports available")
             return
         }
 
-        val usbPort = ports[0]
+        val port = ports[0]
+
         try {
-            usbPort.open(conn)
-            usbPort.setParameters(BAUD_RATE, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            port.open(conn)
+            if (deviceType == DeviceType.SCALE) {
+                port.setParameters(BAUD_RATE, 7, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_EVEN)
+                port.setDTR(true)
+                port.setRTS(true)
+            } else {
+                port.setParameters(BAUD_RATE, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
+            }
+            Log.i(TAG, "Port configured: ${deviceType.name}")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to configure port", e)
-            try { usbPort.close() } catch (_: Exception) {}
+            Log.e(TAG, "Port configuration failed", e)
+            try { port.close() } catch (_: Exception) {}
             conn.close()
-            emitStatus("error", "Port config failed: ${e.message}")
+            emitStatus("error", "Port config failed")
             return
         }
 
         val info = ConnectionInfo(
             connection = conn,
-            port = usbPort,
+            port = port,
             stopRead = AtomicBoolean(false),
             deviceType = deviceType
         )
@@ -256,14 +291,34 @@ class UsbSerialManager(
 
         val typeLabel = if (deviceType == DeviceType.SCALE) "Scale" else "Scanner"
         emitStatus("connected", "$typeLabel connected")
-        Log.i(TAG, "$typeLabel connected at $key")
+        Log.i(TAG, "$typeLabel connected: $key")
 
-        startReadThread(info, key)
-
-        // Only poll weight commands for SCALE devices
         if (deviceType == DeviceType.SCALE) {
+            try {
+                port.write("W\r".toByteArray(), 500)
+            } catch (e: Exception) {
+                Log.w(TAG, "Initial command failed", e)
+            }
+
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    val readBuffer = ByteArray(256)
+                    val bytesRead = port.read(readBuffer, READ_TIMEOUT_MS)
+                    if (bytesRead > 0) {
+                        val rawData = String(readBuffer.take(bytesRead).toByteArray())
+                        Log.d("SCALE_RAW", rawData)
+                        addRawLog("Scale: $rawData")
+                        processLine(rawData, key, deviceType)
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Delayed read error", e)
+                }
+            }, 500)
+
             startWeightPolling(info, key)
         }
+
+        startReadThread(info, key)
     }
 
     private fun startWeightPolling(info: ConnectionInfo, key: String) {
@@ -271,29 +326,31 @@ class UsbSerialManager(
         info.weightPollRunnable = object : Runnable {
             override fun run() {
                 if (info.stopRead.get() || info.port == null) return
+
                 try {
-                    // Magellan/PSC over FTDI RS232 weight request commands
-                    // ESC+W is the standard OBC (Open Bar Code) weight request
                     val commands = listOf(
-                        byteArrayOf(0x1B, 'W'.code.toByte(), '\r'.code.toByte()),           // ESC W \r
-                        byteArrayOf(0x1B, 'S'.code.toByte(), '\r'.code.toByte()),           // ESC S \r
-                        byteArrayOf('W'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte()), // W \r\n
-                        byteArrayOf('S'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte()), // S \r\n
-                        // OBC protocol: STX + command + ETX
-                        byteArrayOf(0x02, 'W'.code.toByte(), 0x03),                         // STX W ETX
-                        byteArrayOf(0x02, 0x57, 0x03),                                      // STX 0x57 ETX
+                        byteArrayOf('W'.code.toByte(), '\r'.code.toByte()),
+                        byteArrayOf('S'.code.toByte(), '\r'.code.toByte()),
+                        byteArrayOf(0x1B, 'W'.code.toByte(), '\r'.code.toByte()),
+                        byteArrayOf(0x1B, 'S'.code.toByte(), '\r'.code.toByte()),
+                        byteArrayOf('W'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte()),
+                        byteArrayOf('S'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte()),
+                        byteArrayOf(0x02, 'W'.code.toByte(), 0x03),
+                        byteArrayOf(0x02, 0x57, 0x03),
                     )
+
                     for (cmd in commands) {
                         try {
                             info.port?.write(cmd, 500)
-                            Thread.sleep(50) // small gap between commands
+                            Thread.sleep(50)
                         } catch (e: Exception) {
-                            Log.w(TAG, "cmd write failed: ${cmd.toList()}", e)
+                            Log.w(TAG, "Poll command failed", e)
                         }
                     }
                 } catch (e: Exception) {
-                    Log.w(TAG, "Weight poll write failed on $key", e)
+                    Log.w(TAG, "Weight poll error", e)
                 }
+
                 if (!info.stopRead.get() && info.port != null) {
                     mainHandler.postDelayed(this, WEIGHT_POLL_INTERVAL_MS)
                 }
@@ -313,31 +370,40 @@ class UsbSerialManager(
             val lineBuffer = StringBuilder()
             val maxLineLength = 128
             val port = info.port ?: return@Thread
+
             while (!info.stopRead.get()) {
                 try {
                     val n = port.read(buffer, READ_TIMEOUT_MS)
-                    if (n > 0) {
-                        for (i in 0 until n) {
-                            val b = buffer[i].toInt().and(0xFF)
-                            if (b == '\n'.code || b == '\r'.code) {
+                    if (n <= 0) continue
+
+                    for (i in 0 until n) {
+                        val b = buffer[i].toInt().and(0x7F)
+                        when {
+                            b == 0x0A || b == 0x0D || b == 0x03 -> {
                                 if (lineBuffer.isNotEmpty()) {
-                                    val line = sanitizeLine(lineBuffer.toString())
+                                    val line = lineBuffer.toString().trim()
                                     lineBuffer.setLength(0)
-                                    if (line.isNotEmpty()) processLine(line, key, info.deviceType)
+                                    if (line.isNotEmpty()) {
+                                        processLine(line, key, info.deviceType)
+                                    }
                                 }
-                            } else if (b >= 32 && b < 127) {
+                            }
+                            b == 0x02 -> lineBuffer.setLength(0)
+                            b in 32..126 -> {
                                 lineBuffer.append(b.toChar())
                                 if (lineBuffer.length >= maxLineLength) {
-                                    val line = sanitizeLine(lineBuffer.toString())
+                                    val line = lineBuffer.toString().trim()
                                     lineBuffer.setLength(0)
-                                    if (line.isNotEmpty()) processLine(line, key, info.deviceType)
+                                    if (line.isNotEmpty()) {
+                                        processLine(line, key, info.deviceType)
+                                    }
                                 }
                             }
                         }
                     }
                 } catch (e: Exception) {
                     if (!info.stopRead.get()) {
-                        Log.e(TAG, "Read error on $key", e)
+                        Log.e(TAG, "Read error", e)
                         mainHandler.post { handleDetach(port.driver.device) }
                     }
                     break
@@ -346,55 +412,31 @@ class UsbSerialManager(
         }.apply { start() }
     }
 
-    /** Strips ASCII control chars (STX/ETX/BCC etc.) and trailing garbage from USB data. */
-    private fun sanitizeLine(raw: String): String {
-        var s = raw.replace(Regex("[\\x00-\\x1F\\x7F]"), "").trim()
-        if (s.length > 1 && !s.last().isLetterOrDigit() && s.last() != '.' && s.last() != ',') {
-            s = s.dropLast(1).trim()
-        }
-        return s
-    }
-
     private fun processLine(line: String, source: String, deviceType: DeviceType) {
         if (line.isEmpty()) return
-        Log.i(TAG, "RECEIVED [$deviceType] from $source: $line")
-
         mainHandler.post {
             addRawLog("$source: $line")
 
             when (deviceType) {
                 DeviceType.SCALE -> {
-                    // Log every line from scale for debugging
-                    Log.i(TAG, "SCALE LINE: '$line' len=${line.length} allDigits=${line.all{it.isDigit()}}")
                     val parsed = parseWeight(line)
-                    Log.i(TAG, "SCALE PARSE RESULT: $parsed")
                     if (parsed != null) {
-                        Log.i(TAG, "SCALE WEIGHT → $line")
                         emitWeight(parsed, "$source: $line")
                     } else if (line.all { it.isDigit() } && line.length in 6..13) {
-                        // Pure digits = barcode from scale, emit as scan
-                        Log.i(TAG, "SCALE BARCODE (no weight) → $line")
                         emitScan("$source: $line")
-                    } else {
-                        Log.i(TAG, "SCALE: unrecognized line → '$line'")
                     }
                 }
                 DeviceType.SCANNER -> {
-                    // Scanner: emit as scan if it looks like a barcode
                     if (looksLikeBarcode(line)) {
-                        Log.i(TAG, "SCAN RECEIVED → $line")
                         emitScan("$source: $line")
                     } else {
-                        // Could still be weight data from a combo unit
                         val parsed = parseWeight(line)
                         if (parsed != null) {
-                            Log.i(TAG, "SCANNER WEIGHT → $line")
                             emitWeight(parsed, "$source: $line")
                         }
                     }
                 }
                 DeviceType.UNKNOWN -> {
-                    // Fallback: try weight, then barcode
                     val parsed = parseWeight(line)
                     if (parsed != null) {
                         emitWeight(parsed, "$source: $line")
@@ -406,7 +448,6 @@ class UsbSerialManager(
         }
     }
 
-    /** Heuristic: line looks like barcode (e.g. 8–64 chars, mostly alphanumeric, no weight pattern). */
     private fun looksLikeBarcode(line: String): Boolean {
         if (line.length !in 4..64) return false
         val alphaNum = line.count { it.isLetterOrDigit() }
@@ -425,7 +466,6 @@ class UsbSerialManager(
         if (trimmed.isEmpty()) return null
         val upper = trimmed.uppercase()
 
-        // Magellan 8500: S11abcd or S14x0abcd (weight in pounds as XX.XX)
         val magellanMatch = Regex("""S1(?:1(\d{4})|4[04]0(\d{4}))\s*$""", RegexOption.IGNORE_CASE).find(trimmed)
         if (magellanMatch != null) {
             val digits = magellanMatch.groupValues[1].ifEmpty { magellanMatch.groupValues[2] }
@@ -439,7 +479,6 @@ class UsbSerialManager(
             }
         }
 
-        // OL = overload
         if (upper == "OL" || upper.startsWith("OL,") || upper.startsWith("OL ")) {
             return JSONObject().apply {
                 put("weight", 0.0)
@@ -448,7 +487,6 @@ class UsbSerialManager(
             }
         }
 
-        // ST/US/S format: ST,GS,+00679.4Kg or US,NT,-002485LB
         val prefixedRegex = Regex(
             """(?:ST|US|S)[,\s]*(?:GS|NT)?,?\s*([+-]?\d+[.,]?\d*)\s*(kg|lb|g|oz)?""",
             RegexOption.IGNORE_CASE
@@ -466,7 +504,6 @@ class UsbSerialManager(
             }
         }
 
-        // Fallback 1: "1.23 kg" or "123.45 lb" (decimal required)
         var fallbackMatch = Regex("""([+-]?\d+[.,]\d+)\s*(kg|lb|g|oz)?""", RegexOption.IGNORE_CASE).find(trimmed)
         if (fallbackMatch != null) {
             val numStr = fallbackMatch.groupValues[1].replace(',', '.')
@@ -479,7 +516,18 @@ class UsbSerialManager(
             }
         }
 
-        // Fallback 2: integer weight "123 kg" at end of line
+        val nciMatch = Regex("""(\d{1,3}[.,]\d{2,3})\s*(lb|kg|g|oz)?""", RegexOption.IGNORE_CASE).find(trimmed)
+        if (nciMatch != null) {
+            val numStr = nciMatch.groupValues[1].replace(',', '.')
+            val unit = nciMatch.groupValues.getOrElse(2) { "lb" }.lowercase()
+            val weight = numStr.toDoubleOrNull() ?: return null
+            return JSONObject().apply {
+                put("weight", weight)
+                put("unit", unit)
+                put("stable", true)
+            }
+        }
+
         fallbackMatch = Regex("""([+-]?\d+)\s*(kg|lb|g|oz)\s*$""", RegexOption.IGNORE_CASE).find(trimmed)
         if (fallbackMatch != null) {
             val numStr = fallbackMatch.groupValues[1]
@@ -492,11 +540,12 @@ class UsbSerialManager(
             }
         }
 
-        // Fallback 3: standalone number at end
         val lastNum = Regex("""([+-]?\d+[.,]?\d*)\s*(kg|lb|g|oz)?\s*$""", RegexOption.IGNORE_CASE).find(trimmed)
         if (lastNum != null) {
             val numStr = lastNum.groupValues[1].replace(',', '.')
-            if (numStr.replace(".", "").replace("-", "").length > 8 && !numStr.contains(".") && !numStr.contains(",")) return null
+            if (numStr.replace(".", "").replace("-", "").length > 8 && !numStr.contains(".") && !numStr.contains(",")) {
+                return null
+            }
             val unit = (lastNum.groupValues.getOrElse(2) { "" }).lowercase().ifEmpty { "kg" }
             val weight = numStr.toDoubleOrNull() ?: return null
             if (weight >= 0.001 && weight <= 99999.999) {
@@ -508,7 +557,6 @@ class UsbSerialManager(
             }
         }
 
-        // Fallback 4: barcode+weight concatenated (all digits, 10-16 chars)
         if (trimmed.all { it.isDigit() } && trimmed.length in 10..16) {
             if (trimmed.length >= 4) {
                 val last4 = trimmed.takeLast(4)
@@ -540,11 +588,16 @@ class UsbSerialManager(
     private fun handleDetach(device: UsbDevice) {
         val key = device.deviceName
         val info = deviceConnections[key] ?: return
-        val typeLabel = if (info.deviceType == DeviceType.SCALE) "Scale" else "Scanner"
+
         closePort(info, key)
         deviceConnections.remove(key)
+
+        val typeLabel = if (info.deviceType == DeviceType.SCALE) "Scale" else "Scanner"
         emitStatus("disconnected", "$typeLabel disconnected")
+        Log.i(TAG, "$typeLabel disconnected: $key")
+
         if (listening) {
+            Log.i(TAG, "Reconnecting...")
             emitStatus("connecting", "Reconnecting...")
             mainHandler.postDelayed({ findAndConnect() }, 1000)
         }
@@ -564,23 +617,27 @@ class UsbSerialManager(
     private fun emitStatus(status: String, message: String) {
         mainHandler.post {
             try {
+                if (eventSink == null) return@post
                 val json = JSONObject().apply {
                     put("type", "status")
                     put("status", status)
                     put("message", message)
                 }
                 eventSink?.success(json.toString())
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.e(TAG, "Status emit failed", e)
+            }
         }
     }
 
     private fun emitWeight(json: JSONObject, rawLine: String) {
         mainHandler.post {
             try {
+                if (eventSink == null) return@post
                 val w = json.getDouble("weight")
                 val unit = json.getString("unit")
                 val stable = json.getBoolean("stable")
-                Log.i(TAG, "WEIGHT: $w $unit stable=$stable (raw: $rawLine)")
+                Log.i(TAG, "Weight: $w $unit")
                 val wrapper = JSONObject().apply {
                     put("type", "weight")
                     put("weight", w)
@@ -589,20 +646,23 @@ class UsbSerialManager(
                     put("raw", rawLine)
                 }
                 eventSink?.success(wrapper.toString())
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                Log.e(TAG, "Weight emit failed", e)
+            }
         }
     }
 
     private fun emitRaw(line: String) {
         mainHandler.post {
             try {
+                if (eventSink == null) return@post
                 val json = JSONObject().apply {
                     put("type", "raw")
                     put("raw", line)
                 }
-                eventSink?.success(json.toString()) ?: Log.w(TAG, "emitRaw: eventSink is null")
+                eventSink?.success(json.toString())
             } catch (e: Exception) {
-                Log.e(TAG, "emitRaw failed", e)
+                Log.e(TAG, "Raw emit failed", e)
             }
         }
     }
@@ -610,13 +670,15 @@ class UsbSerialManager(
     private fun emitScan(line: String) {
         mainHandler.post {
             try {
+                if (eventSink == null) return@post
+                Log.i(TAG, "Scan: $line")
                 val json = JSONObject().apply {
                     put("type", "scan")
                     put("raw", line)
                 }
                 eventSink?.success(json.toString())
             } catch (e: Exception) {
-                Log.e(TAG, "emitScan failed", e)
+                Log.e(TAG, "Scan emit failed", e)
             }
         }
     }
@@ -627,7 +689,8 @@ class UsbSerialManager(
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ACTION_USB_PERMISSION) {
                 val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                val device = intent.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
+                @Suppress("DEPRECATION")
+                val device = intent?.getParcelableExtra<UsbDevice>(UsbManager.EXTRA_DEVICE)
                 manager.onPermissionResult(granted, device)
             }
         }
